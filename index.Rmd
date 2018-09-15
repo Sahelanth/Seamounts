@@ -1,0 +1,138 @@
+---
+title: "Seamounts"
+author: "James Pitt"
+date: "August 21, 2018"
+output: html_document
+---
+
+```{r start, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+## Seamounts Are What They Sound Like
+
+Seamounts are basically islands that don't reach the surface. They tend to attract lots of underwater life, especially when their peak is in shallow enough water to get a lot of sunlight. Because of that, fishermen target seamounts, and many have been overfished.
+
+I wondered whether seamounts in international waters had more diverse ecosystems than seamounts in countries' exclusive economic zones. Fortunately, there's some great open data to examine that with.
+
+```{r setup}
+library(tidyverse)
+library(readr)
+library(maps)
+library(sf)
+
+download.file("http://seamounts.sdsc.edu/SeamountsTablesAsCSV.zip", destfile="./testdownload.zip")
+
+filenames <- unzip("./testdownload.zip")
+```
+
+Those files are in a format that requires a lot of joining.
+
+```{r joins, message=FALSE, warning=FALSE}
+#To get what species were seen where:
+#join OBSERVATIONS$NAME_ID to NAMES$NAME_ID to get what species where observed
+OBSERVATIONS <- read_csv(filenames[2])
+OBSERVATIONS <- select(OBSERVATIONS,  OBSERVATION_ID, SAMPLE_ID, NAME_ID, COUNT)
+NAMES <- read_csv(filenames[1])
+NAMES <- select(NAMES, NAME_ID, KINGDOM, PHYLUM, CLASS, ORDER, FAMILY, GENUS, NAME)
+data <- inner_join(OBSERVATIONS, NAMES)
+
+#join OBSERVATIONS$SAMPLE_ID to SAMPLES$SAMPLE_ID
+SAMPLES <- read_csv(filenames[6])
+SAMPLES <- select(SAMPLES, SAMPLE_ID, SEAMOUNT_ID, START_DATE)
+data <- inner_join(data, SAMPLES)
+
+#join SAMPLES$SEAMOUNT_ID to SEAMOUNTS$SEAMOUNT_ID to get location
+SEAMOUNTS <- read_csv(filenames[7])
+SEAMOUNTS <- select(SEAMOUNTS, SEAMOUNT_ID, LATITUDE, LONGITUDE, SUMMIT_DEPTH)
+data <- inner_join(data, SEAMOUNTS)
+```
+
+Once all the data is together, we can see we have `r length(data$OBSERVATION_ID)` observations of `r length(unique(data$NAME))` species at `r length(unique(data$SEAMOUNT_ID))` seamounts.
+
+##Depth
+
+I wonder, is there a relationship between how deep underwater a seamount's top is and its species diversity?
+
+```{r speciescounts, message=FALSE, warning=FALSE}
+speciescountdata <- data %>% group_by(SEAMOUNT_ID) %>% summarize(speciescount=n_distinct(NAME))
+speciescountdata <- inner_join(speciescountdata, SEAMOUNTS)
+
+#Use the negative of summit depth as the y-axis, to visually show depth underwater.
+qplot(speciescountdata$speciescount, -(speciescountdata$SUMMIT_DEPTH))
+```
+
+There are more shallow sites where a lot of species have been found than deep sites where a lot of species have been found. But there are more shallow sites, period. And it doesn't look like there's any kind of straight-line relationship between depth and species count.
+
+Important note: the more you look in one place, the more species you'll find. This is called "sampling effort." It is easier to look closer to shore and shallower underwater. I have made no attempt to control for sampling effort here or later. Ecologist friends, please do not feed me to bears.
+
+##EEZs
+
+I mentioned exclusive economic zones earlier. The UN keeps track of which waters each country has an exclusive right to mine, fish, etc.
+
+Non-scripted bit: on http://www.marineregions.org/downloads.php, click 'Maritime Boundaries v10', click 'download' next to the file 'World EEZ v10 (2018-02-21, 119 MB)' and fill out the form.
+Then:
+
+```{r spatialjoins, message=FALSE, warning=FALSE}
+eez_full <- st_read("./World_EEZ_v10_20180221/eez_v10.shp")
+
+speciescountdata_spatial <- speciescountdata %>% 
+  st_as_sf(coords=c("LONGITUDE", "LATITUDE"), crs = "+proj=longlat") %>% 
+  st_transform(crs=st_crs(eez_full))
+
+seamounts_spatial <- speciescountdata %>% 
+  st_as_sf(coords=c("LONGITUDE", "LATITUDE"), crs = "+proj=longlat") %>% 
+  st_transform(crs=st_crs(eez_full))
+
+seamounts_in_eezs <- st_join(eez_full, seamounts_spatial, left=T)
+length(unique(seamounts_in_eezs$SEAMOUNT_ID))
+```
+
+89 Of the `r length(unique(data$SEAMOUNT_ID))` seamounts are in country's EEZs.
+
+##Species counts in vs outside EEZs
+
+```{r}
+seamounts_outside_eezs <- speciescountdata[!speciescountdata$SEAMOUNT_ID %in% seamounts_in_eezs$SEAMOUNT_ID,]
+
+mean(seamounts_in_eezs$speciescount, na.rm=TRUE)
+mean(seamounts_outside_eezs$speciescount, na.rm=TRUE)
+```
+
+An average of 43.3 species have been observed at each seamount in an EEZ, compared to 37.9 species at each EEZ outside EEZs. But that may reflect sampling effort. It's easier to look near the coast than in international waters.
+
+Where are the seamounts with the most species?
+
+##By country that owns them:
+```{r, message=FALSE, warning=FALSE}
+sovereign_dataframe <- as.data.frame(cbind(as.character(seamounts_in_eezs$Sovereign1), seamounts_in_eezs$speciescount))
+sovereign_dataframe$V1 <- as.character(sovereign_dataframe$V1)
+sovereign_dataframe$V2 <- as.numeric(sovereign_dataframe$V2)
+na.omit(sovereign_dataframe) %>% group_by(V1) %>% summarize(mean=mean(V2)) %>% 
+  ggplot() + geom_bar(aes(x=V1, y=mean), stat="identity") + coord_flip()
+```
+
+
+##By location:
+```{r, message=FALSE, warning=FALSE}
+geoname_dataframe <- as.data.frame(cbind(as.character(seamounts_in_eezs$GeoName), seamounts_in_eezs$speciescount))
+geoname_dataframe$V1 <- as.character(geoname_dataframe$V1)
+geoname_dataframe$V1 <- str_replace_all(geoname_dataframe$V1, "Exclusive Economic Zone", "EEZ")
+geoname_dataframe$V2 <- as.numeric(geoname_dataframe$V2)
+na.omit(geoname_dataframe) %>% group_by(V1) %>% summarize(mean=mean(V2)) %>% 
+  ggplot() + geom_bar(aes(x=V1, y=mean), stat="identity") + coord_flip()
+```
+
+
+##And here's the map.
+```{r, message=FALSE, warning=FALSE}
+map <- map_data(map="world")
+ggplot() + 
+  geom_polygon(data = map, aes(x=long, y = lat, group = group), fill="grey80") +
+  geom_point(data = speciescountdata, size=5, alpha=0.5, aes(x=LONGITUDE, y = LATITUDE, color=speciescount)) +
+  geom_sf(data=eez_full, color="violet", alpha=0.5) +
+  scale_color_distiller(palette="YlGnBu") +
+  theme_light() + theme(panel.grid=element_blank())
+```
+
